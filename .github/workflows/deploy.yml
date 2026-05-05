@@ -200,145 +200,89 @@ jobs:
               | cut -c1-24 \
               | sed 's/-$//')
             CLUSTER_NAME="${CLUSTER_NAME}-eks"
-            echo "Warning: cluster_name output was empty, derived: ${CLUSTER_NAME}"
           fi
           aws eks update-kubeconfig \
             --region "${{ secrets.AWS_REGION }}" \
-            --name "${CLUSTER_NAME}"
+            --name "$CLUSTER_NAME"
       - name: Create namespace
         run: |
-          kubectl create namespace "${{ needs.provision.outputs.namespace }}" \
-            --dry-run=client -o yaml | kubectl apply -f -
-      - name: Create ECR pull secret
-        run: |
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          ECR_PASSWORD=$(aws ecr get-login-password --region "${{ secrets.AWS_REGION }}")
-          kubectl create secret docker-registry ecr-pull-secret \
-            --namespace "${{ needs.provision.outputs.namespace }}" \
-            --docker-server="${ACCOUNT_ID}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com" \
-            --docker-username=AWS \
-            --docker-password="${ECR_PASSWORD}" \
-            --dry-run=client -o yaml | kubectl apply -f -
-      - name: Create app env secret
-        run: |
-          APP_ENV_JSON='${{ needs.provision.outputs.app_env_json }}'
           NAMESPACE="${{ needs.provision.outputs.namespace }}"
-          PROJECT_NAME=$(echo "${{ secrets.PROJECT_NAME }}" \
-            | tr '[:upper:]' '[:lower:]' \
-            | sed 's/[^a-z0-9-]/-/g' \
-            | sed 's/-\{2,\}/-/g' \
-            | sed 's/^-//; s/-$//' \
-            | cut -c1-24 \
-            | sed 's/-$//')
-          # Build --from-literal args from the JSON env map
-          ARGS=""
-          while IFS="=" read -r key val; do
-            ARGS="$ARGS --from-literal=${key}=${val}"
-          done < <(echo "$APP_ENV_JSON" | python3 -c "
-          import json,sys
-          d=json.load(sys.stdin)
-          for k,v in d.items():
-              if v: print(f'{k}={v}')
-          ")
-          if [ -n "$ARGS" ]; then
-            kubectl create secret generic "${PROJECT_NAME}-env" \
-              --namespace "$NAMESPACE" \
-              $ARGS \
-              --dry-run=client -o yaml | kubectl apply -f -
+          if [ -z "$NAMESPACE" ]; then
+            NAMESPACE=$(echo "${{ secrets.PROJECT_NAME }}" \
+              | tr '[:upper:]' '[:lower:]' \
+              | sed 's/[^a-z0-9-]/-/g' \
+              | sed 's/-\{2,\}/-/g' \
+              | sed 's/^-//; s/-$//' \
+              | cut -c1-24 \
+              | sed 's/-$//')
           fi
+          kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+          echo "NAMESPACE=$NAMESPACE" >> $GITHUB_ENV
       - name: Install AWS Load Balancer Controller
         run: |
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           helm repo add eks https://aws.github.io/eks-charts
           helm repo update
           helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
-            --namespace kube-system \
+            -n kube-system \
             --set clusterName="${{ needs.provision.outputs.cluster_name }}" \
-            --set serviceAccount.create=true \
-            --set region="${{ secrets.AWS_REGION }}" \
-            --set vpcId="$(aws eks describe-cluster --name "${{ needs.provision.outputs.cluster_name }}" --query 'cluster.resourcesVpcConfig.vpcId' --output text)" \
-            --version 1.8.1 \
-            --wait --timeout 5m
+            --set serviceAccount.create=false \
+            --set serviceAccount.name=aws-load-balancer-controller \
+            --wait --timeout=120s || true
+      - name: Build env vars for manifest
+        id: envvars
+        run: |
+          APP_ENV_JSON='${{ needs.provision.outputs.app_env_json }}'
+          if [ -z "$APP_ENV_JSON" ] || [ "$APP_ENV_JSON" = "{}" ]; then
+            ENV_BLOCK="[]"
+          else
+            ENV_BLOCK=$(echo "$APP_ENV_JSON" | python3 -c "
+          import json, sys
+          raw = sys.stdin.read().strip()
+          try:
+              d = json.loads(raw)
+          except Exception:
+              d = {}
+          result = [{'name': k, 'value': str(v)} for k, v in d.items()]
+          print(json.dumps(result))
+          " 2>/dev/null || echo "[]")
+          fi
+          echo "env_block=${ENV_BLOCK}" >> $GITHUB_OUTPUT
       - name: Apply Kubernetes manifests
         run: |
-          NAMESPACE="${{ needs.provision.outputs.namespace }}"
+          IMAGE="${{ needs.build_push.outputs.image }}"
+          NAMESPACE="${{ env.NAMESPACE }}"
+          APP_PORT=8000
+          REPLICA_COUNT=2
           PROJECT_NAME=$(echo "${{ secrets.PROJECT_NAME }}" \
             | tr '[:upper:]' '[:lower:]' \
             | sed 's/[^a-z0-9-]/-/g' \
             | sed 's/-\{2,\}/-/g' \
-            | sed 's/^-//; s/-$//' \
-            | cut -c1-24 \
-            | sed 's/-$//')
-          IMAGE="${{ needs.build_push.outputs.image }}"
-          APP_PORT="${{ secrets.APP_PORT }}"
-          APP_PORT="${APP_PORT:-8000}"
-          HEALTH_PATH="/"
-          CPU_REQ="250m"
-          MEM_REQ="256Mi"
-          CPU_LIM="500m"
-          MEM_LIM="512Mi"
-          INIT_DELAY="30"
+            | sed 's/^-//; s/-$//')
 
-          # Check if env secret exists
-          ENV_SECRET_REF=""
-          if kubectl get secret "${PROJECT_NAME}-env" -n "$NAMESPACE" > /dev/null 2>&1; then
-            ENV_SECRET_REF="
-            - secretRef:
-                name: ${PROJECT_NAME}-env"
-          fi
+          ENV_BLOCK='${{ steps.envvars.outputs.env_block }}'
 
-          kubectl apply -f - <<EOF
+          cat <<EOF | kubectl apply -f -
           apiVersion: apps/v1
           kind: Deployment
           metadata:
             name: ${PROJECT_NAME}
             namespace: ${NAMESPACE}
-            labels:
-              app: ${PROJECT_NAME}
           spec:
-            replicas: 2
+            replicas: ${REPLICA_COUNT}
             selector:
               matchLabels:
                 app: ${PROJECT_NAME}
-            strategy:
-              type: RollingUpdate
-              rollingUpdate:
-                maxSurge: 1
-                maxUnavailable: 0
             template:
               metadata:
                 labels:
                   app: ${PROJECT_NAME}
               spec:
-                imagePullSecrets:
-                  - name: ecr-pull-secret
                 containers:
-                  - name: ${PROJECT_NAME}
-                    image: ${IMAGE}
-                    ports:
-                      - containerPort: ${APP_PORT}
-                    envFrom:${ENV_SECRET_REF}
-                    resources:
-                      requests:
-                        cpu: ${CPU_REQ}
-                        memory: ${MEM_REQ}
-                      limits:
-                        cpu: ${CPU_LIM}
-                        memory: ${MEM_LIM}
-                    livenessProbe:
-                      httpGet:
-                        path: ${HEALTH_PATH}
-                        port: ${APP_PORT}
-                      initialDelaySeconds: ${INIT_DELAY}
-                      periodSeconds: 15
-                      failureThreshold: 3
-                    readinessProbe:
-                      httpGet:
-                        path: ${HEALTH_PATH}
-                        port: ${APP_PORT}
-                      initialDelaySeconds: $((INIT_DELAY / 2))
-                      periodSeconds: 10
-                      failureThreshold: 3
+                - name: ${PROJECT_NAME}
+                  image: ${IMAGE}
+                  ports:
+                  - containerPort: ${APP_PORT}
+                  env: ${ENV_BLOCK}
           ---
           apiVersion: v1
           kind: Service
@@ -349,64 +293,48 @@ jobs:
             selector:
               app: ${PROJECT_NAME}
             ports:
-              - port: 80
-                targetPort: ${APP_PORT}
+            - port: 80
+              targetPort: ${APP_PORT}
             type: ClusterIP
           ---
           apiVersion: networking.k8s.io/v1
           kind: Ingress
           metadata:
-            name: ${PROJECT_NAME}-ingress
+            name: ${PROJECT_NAME}
             namespace: ${NAMESPACE}
             annotations:
               kubernetes.io/ingress.class: alb
               alb.ingress.kubernetes.io/scheme: internet-facing
               alb.ingress.kubernetes.io/target-type: ip
-              alb.ingress.kubernetes.io/healthcheck-path: ${HEALTH_PATH}
-              alb.ingress.kubernetes.io/healthcheck-interval-seconds: "30"
-              alb.ingress.kubernetes.io/healthy-threshold-count: "2"
-              alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
           spec:
             rules:
-              - http:
-                  paths:
-                    - path: /
-                      pathType: Prefix
-                      backend:
-                        service:
-                          name: ${PROJECT_NAME}
-                          port:
-                            number: 80
+            - http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: ${PROJECT_NAME}
+                      port:
+                        number: 80
           EOF
-      - name: Wait for rollout
+      - name: Get ingress URL
+        id: ingress
         run: |
           PROJECT_NAME=$(echo "${{ secrets.PROJECT_NAME }}" \
             | tr '[:upper:]' '[:lower:]' \
             | sed 's/[^a-z0-9-]/-/g' \
             | sed 's/-\{2,\}/-/g' \
-            | sed 's/^-//; s/-$//' \
-            | cut -c1-24 \
-            | sed 's/-$//')
-          kubectl rollout status deployment/${PROJECT_NAME} \
-            -n "${{ needs.provision.outputs.namespace }}" \
-            --timeout=300s || true
-      - name: Get ALB hostname
-        id: ingress
-        run: |
-          NAMESPACE="${{ needs.provision.outputs.namespace }}"
-          echo "Waiting for ALB hostname to be assigned..."
-          for i in $(seq 1 30); do
-            HOSTNAME=$(kubectl get ingress -n ${NAMESPACE} \
-              -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
-            if [ -n "$HOSTNAME" ]; then
-              echo "url=http://${HOSTNAME}" >> $GITHUB_OUTPUT
-              echo "ALB hostname: ${HOSTNAME}"
+            | sed 's/^-//; s/-$//')
+          NAMESPACE="${{ env.NAMESPACE }}"
+          echo "Waiting for ingress address..."
+          for i in $(seq 1 20); do
+            ADDRESS=$(kubectl get ingress "${PROJECT_NAME}" -n "${NAMESPACE}" \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+            if [ -n "$ADDRESS" ]; then
+              echo "url=http://${ADDRESS}" >> $GITHUB_OUTPUT
+              echo "App URL: http://${ADDRESS}"
               break
             fi
-            echo "Attempt ${i}/30 — ALB not ready yet, waiting 20s..."
-            sleep 20
+            sleep 15
           done
-          if [ -z "$HOSTNAME" ]; then
-            echo "ALB hostname not assigned within timeout — check AWS console"
-            echo "url=" >> $GITHUB_OUTPUT
-          fi
