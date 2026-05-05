@@ -204,7 +204,119 @@ jobs:
           aws eks update-kubeconfig \
             --region "${{ secrets.AWS_REGION }}" \
             --name "$CLUSTER_NAME"
-      - name: Create namespace
+      - name: Install AWS Load Balancer Controller
+        run: |
+          CLUSTER_NAME="${{ needs.provision.outputs.cluster_name }}"
+          if [ -z "$CLUSTER_NAME" ]; then
+            CLUSTER_NAME=$(echo "${{ secrets.PROJECT_NAME }}" \
+              | tr '[:upper:]' '[:lower:]' \
+              | sed 's/[^a-z0-9-]/-/g' \
+              | sed 's/-\{2,\}/-/g' \
+              | sed 's/^-//; s/-$//' \
+              | cut -c1-24 \
+              | sed 's/-$//')
+            CLUSTER_NAME="${CLUSTER_NAME}-eks"
+          fi
+          helm repo add eks https://aws.github.io/eks-charts 2>/dev/null || true
+          helm repo update
+          helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+            -n kube-system \
+            --set clusterName="${CLUSTER_NAME}" \
+            --set serviceAccount.create=false \
+            --set serviceAccount.name=aws-load-balancer-controller \
+            --wait --timeout=5m || true
+      - name: Deploy application
+        run: |
+          NAMESPACE="${{ needs.provision.outputs.namespace }}"
+          IMAGE="${{ needs.build_push.outputs.image }}"
+          APP_ENV_JSON='${{ needs.provision.outputs.app_env_json }}'
+
+          if [ -z "$NAMESPACE" ]; then
+            NAMESPACE=$(echo "${{ secrets.PROJECT_NAME }}" \
+              | tr '[:upper:]' '[:lower:]' \
+              | sed 's/[^a-z0-9-]/-/g' \
+              | sed 's/-\{2,\}/-/g' \
+              | sed 's/^-//; s/-$//' \
+              | cut -c1-24 \
+              | sed 's/-$//')
+          fi
+
+          kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+
+          ENV_VARS=$(python3 << 'PYEOF'
+import json, sys
+raw = sys.stdin.read().strip()
+try:
+    d = json.loads(raw)
+except Exception:
+    d = {}
+result = [{'name': k, 'value': str(v)} for k, v in d.items()]
+print(json.dumps(result))
+PYEOF
+<< "INPUTEOF"
+${APP_ENV_JSON}
+INPUTEOF
+)
+
+          cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${{ secrets.PROJECT_NAME }}
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ${{ secrets.PROJECT_NAME }}
+  template:
+    metadata:
+      labels:
+        app: ${{ secrets.PROJECT_NAME }}
+    spec:
+      containers:
+      - name: app
+        image: ${IMAGE}
+        ports:
+        - containerPort: 8000
+        env: $(echo "${ENV_VARS}" | python3 -c "import json,sys,yaml; data=json.load(sys.stdin); print(yaml.dump(data, default_flow_style=True).strip())" 2>/dev/null || echo "[]")
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${{ secrets.PROJECT_NAME }}
+  namespace: ${NAMESPACE}
+spec:
+  selector:
+    app: ${{ secrets.PROJECT_NAME }}
+  ports:
+  - port: 80
+    targetPort: 8000
+  type: ClusterIP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ${{ secrets.PROJECT_NAME }}
+  namespace: ${NAMESPACE}
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+spec:
+  rules:
+  - http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: ${{ secrets.PROJECT_NAME }}
+            port:
+              number: 80
+EOF
+      - name: Get ingress URL
+        id: ingress
         run: |
           NAMESPACE="${{ needs.provision.outputs.namespace }}"
           if [ -z "$NAMESPACE" ]; then
@@ -216,125 +328,15 @@ jobs:
               | cut -c1-24 \
               | sed 's/-$//')
           fi
-          kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
-          echo "NAMESPACE=$NAMESPACE" >> $GITHUB_ENV
-      - name: Install AWS Load Balancer Controller
-        run: |
-          helm repo add eks https://aws.github.io/eks-charts
-          helm repo update
-          helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
-            -n kube-system \
-            --set clusterName="${{ needs.provision.outputs.cluster_name }}" \
-            --set serviceAccount.create=false \
-            --set serviceAccount.name=aws-load-balancer-controller \
-            --wait --timeout=120s || true
-      - name: Build env vars for manifest
-        id: envvars
-        run: |
-          APP_ENV_JSON='${{ needs.provision.outputs.app_env_json }}'
-          if [ -z "$APP_ENV_JSON" ] || [ "$APP_ENV_JSON" = "{}" ]; then
-            ENV_BLOCK="[]"
-          else
-            ENV_BLOCK=$(echo "$APP_ENV_JSON" | python3 -c "
-          import json, sys
-          raw = sys.stdin.read().strip()
-          try:
-              d = json.loads(raw)
-          except Exception:
-              d = {}
-          result = [{'name': k, 'value': str(v)} for k, v in d.items()]
-          print(json.dumps(result))
-          " 2>/dev/null || echo "[]")
-          fi
-          echo "env_block=${ENV_BLOCK}" >> $GITHUB_OUTPUT
-      - name: Apply Kubernetes manifests
-        run: |
-          IMAGE="${{ needs.build_push.outputs.image }}"
-          NAMESPACE="${{ env.NAMESPACE }}"
-          APP_PORT=8000
-          REPLICA_COUNT=2
-          PROJECT_NAME=$(echo "${{ secrets.PROJECT_NAME }}" \
-            | tr '[:upper:]' '[:lower:]' \
-            | sed 's/[^a-z0-9-]/-/g' \
-            | sed 's/-\{2,\}/-/g' \
-            | sed 's/^-//; s/-$//')
-
-          ENV_BLOCK='${{ steps.envvars.outputs.env_block }}'
-
-          cat <<EOF | kubectl apply -f -
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata:
-            name: ${PROJECT_NAME}
-            namespace: ${NAMESPACE}
-          spec:
-            replicas: ${REPLICA_COUNT}
-            selector:
-              matchLabels:
-                app: ${PROJECT_NAME}
-            template:
-              metadata:
-                labels:
-                  app: ${PROJECT_NAME}
-              spec:
-                containers:
-                - name: ${PROJECT_NAME}
-                  image: ${IMAGE}
-                  ports:
-                  - containerPort: ${APP_PORT}
-                  env: ${ENV_BLOCK}
-          ---
-          apiVersion: v1
-          kind: Service
-          metadata:
-            name: ${PROJECT_NAME}
-            namespace: ${NAMESPACE}
-          spec:
-            selector:
-              app: ${PROJECT_NAME}
-            ports:
-            - port: 80
-              targetPort: ${APP_PORT}
-            type: ClusterIP
-          ---
-          apiVersion: networking.k8s.io/v1
-          kind: Ingress
-          metadata:
-            name: ${PROJECT_NAME}
-            namespace: ${NAMESPACE}
-            annotations:
-              kubernetes.io/ingress.class: alb
-              alb.ingress.kubernetes.io/scheme: internet-facing
-              alb.ingress.kubernetes.io/target-type: ip
-          spec:
-            rules:
-            - http:
-                paths:
-                - path: /
-                  pathType: Prefix
-                  backend:
-                    service:
-                      name: ${PROJECT_NAME}
-                      port:
-                        number: 80
-          EOF
-      - name: Get ingress URL
-        id: ingress
-        run: |
-          PROJECT_NAME=$(echo "${{ secrets.PROJECT_NAME }}" \
-            | tr '[:upper:]' '[:lower:]' \
-            | sed 's/[^a-z0-9-]/-/g' \
-            | sed 's/-\{2,\}/-/g' \
-            | sed 's/^-//; s/-$//')
-          NAMESPACE="${{ env.NAMESPACE }}"
-          echo "Waiting for ingress address..."
           for i in $(seq 1 20); do
-            ADDRESS=$(kubectl get ingress "${PROJECT_NAME}" -n "${NAMESPACE}" \
+            URL=$(kubectl get ingress "${{ secrets.PROJECT_NAME }}" \
+              -n "$NAMESPACE" \
               -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
-            if [ -n "$ADDRESS" ]; then
-              echo "url=http://${ADDRESS}" >> $GITHUB_OUTPUT
-              echo "App URL: http://${ADDRESS}"
+            if [ -n "$URL" ]; then
+              echo "url=http://${URL}" >> $GITHUB_OUTPUT
+              echo "App URL: http://${URL}"
               break
             fi
+            echo "Waiting for ingress... (${i}/20)"
             sleep 15
           done
